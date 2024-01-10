@@ -5,11 +5,15 @@ import logging
 import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence
+from tqdm.auto import tqdm
 
+import math
 import torch
 import transformers
-from torch.utils.data import Dataset
+import numpy as np
 from transformers import Trainer
+from torch.utils.data import Dataset
+from transformers.optimization import AdamW, get_scheduler
 
 
 from peft import PeftModel, LoraConfig, TaskType, get_peft_model
@@ -84,6 +88,10 @@ class TrainingArguments(transformers.TrainingArguments):
         default="default",
         metadata={"help": "Experiment name"},
     )
+    ipdb_debug: bool = field(
+        default=False,
+        metadata={"help": ""},
+    )
 
 
 def smart_tokenizer_and_embedding_resize(
@@ -119,7 +127,7 @@ def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedToken
             max_length=tokenizer.model_max_length,
             truncation=True,
         )
-        for text in strings
+        for text in tqdm(strings, desc="Dataset Tokenization")
     ]
     input_ids = labels = [tokenized.input_ids[0] for tokenized in tokenized_list]
     input_ids_lens = labels_lens = [
@@ -187,7 +195,6 @@ class DataCollatorForSupervisedDataset(object):
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
 
-
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     logging.warning("Downloading Data")
@@ -196,6 +203,54 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
     train_dataset = SupervisedDataset(raw_data=train_set, tokenizer=tokenizer)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+
+
+def group_model_parameters(model):
+    param_groups_dict = {}
+    for n,p in model.named_parameters():
+        if p.requires_grad and "lora_" in n:
+            module_name = n.replace("lora_A", "%s").replace("lora_B", "%s")
+            if module_name not in param_groups_dict:
+                param_groups_dict[module_name] = {
+                    "params": [p],
+                    "param_name": [n],
+                }
+            else:
+                param_groups_dict[module_name]["params"].append(p)
+                param_groups_dict[module_name]["param_name"].append(n)
+    return param_groups_dict
+            
+
+def calculate_max_step(args, len_dataloader):
+    num_update_steps_per_epoch = (
+        len_dataloader // args.gradient_accumulation_steps // args.train_batch_size
+    )
+    num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1)
+    if args.max_steps > 0:
+        max_steps = args.max_steps
+        num_train_epochs = args.max_steps // num_update_steps_per_epoch + int(
+            args.max_steps % num_update_steps_per_epoch > 0
+        )
+    else:
+        max_steps = math.ceil(args.num_train_epochs * num_update_steps_per_epoch)
+        num_train_epochs = math.ceil(args.num_train_epochs)
+    return max_steps, num_train_epochs
+
+def create_optimizer_and_scheduler(args, grouped_parameters, num_training_steps):
+    optimizer_kwargs = {
+        "lr": args.learning_rate, 
+        "betas": (args.adam_beta1, args.adam_beta2),
+        "eps": args.adam_epsilon,
+    }
+    optimizer = AdamW(grouped_parameters, **optimizer_kwargs)
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler_type,
+        optimizer=optimizer, 
+        num_warmup_steps=args.get_warmup_steps(num_training_steps),
+        num_training_steps=num_training_steps,
+        scheduler_specific_kwargs=args.lr_scheduler_kwargs,
+    )
+    return (optimizer, lr_scheduler)
 
 
 def train():
@@ -260,6 +315,7 @@ def train():
         padding_side="right",
         use_fast=False,
     )
+
     special_tokens_dict = dict()
     if tokenizer.pad_token is None:
         special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
@@ -285,7 +341,29 @@ def train():
         f"lr_{training_args.learning_rate}",
         f"seed_{training_args.seed}",
     )
-    trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+
+    if training_args.ipdb_debug:
+        import ipdb 
+        ipdb.set_trace()
+
+    param_groups_dict = group_model_parameters(model)
+    param_groups = list(param_groups_dict.values())
+    num_training_steps,num_train_epochs  = calculate_max_step(
+        training_args, len(data_module["train_dataset"])
+    )
+    optimizer, lr_scheduler = create_optimizer_and_scheduler(
+        args=training_args, 
+        grouped_parameters=param_groups, 
+        num_training_steps=num_training_steps,
+    )
+    
+    trainer = Trainer(
+        model=model, 
+        tokenizer=tokenizer, 
+        optimizers=(optimizer, lr_scheduler), 
+        args=training_args, 
+        **data_module,
+    )
     trainer.train()
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)

@@ -18,6 +18,7 @@ import re
 import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional
+from tqdm.auto import tqdm
 
 import torch
 import transformers
@@ -207,7 +208,7 @@ def evaluation(model_args, data_args):
     }
     ans_pred_list = []
     set_seed(42)
-    for step, batch in enumerate(question_data):
+    for step, batch in enumerate(tqdm(question_data, desc="Evaluate")):
         with torch.no_grad():
             gen_kwargs["input_ids"] = batch["input_ids"].to('cuda')
             gen_kwargs["attention_mask"] = batch["attention_mask"].to('cuda')
